@@ -1,8 +1,9 @@
 # Servidor en la nube para el carro de inspección de estantería
 #
-#   ESP32 (carro) --HTTPS cada 1 s--> /api/dispositivo/sync
-#        envía: su estado + eventos nuevos (falta producto, repuesto, inicio, paro...)
-#        recibe: las órdenes pendientes (iniciar, detener, borrar alarmas, cambiar pausa)
+#   ESP32 (carro) <==WebSocket permanente==> /ws/carro   (tiempo real, conexión que queda abierta)
+#        envía: su estado + eventos nuevos (falta producto, repuesto, inicio, paro...) apenas cambian
+#        recibe: las órdenes (iniciar, detener, borrar alarmas, cambiar pausa) en el instante en que se dan
+#   /api/dispositivo/sync (HTTPS) sigue disponible para el simulador o como respaldo
 #
 #   Navegador / celular --> panel con contraseña (/), que lee /api/estado y /api/eventos
 #        y envía órdenes a /api/comando
@@ -24,7 +25,10 @@ from datetime import datetime, timedelta
 from functools import wraps
 from zoneinfo import ZoneInfo
 
+import json
+
 import psycopg
+from flask_sock import Sock
 from flask import Flask, jsonify, redirect, render_template_string, request, session, url_for
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
@@ -52,6 +56,8 @@ COLA = []                 # órdenes pendientes: dict(id, comando, valor, creado
 GUARDADO_ESTADO = [0.0]   # última vez que se copió el estado a la base de datos
 
 app = Flask(__name__)
+sock = Sock(app)
+HAY_ORDEN = threading.Condition()   # despierta la conexión del carro cuando hay una orden nueva
 # Si no hay SECRET_KEY en Render, se deriva de las variables que ya existen (no cambia al reiniciar)
 app.secret_key = os.environ.get("SECRET_KEY") or hashlib.sha256(("sesion-panel|" + API_KEY + "|" + DATABASE_URL).encode()).hexdigest()
 app.config.update(
@@ -117,13 +123,8 @@ def error_bd(e):
 
 
 # ================= API del carro (ESP32) =================
-@app.route("/api/dispositivo/sync", methods=["POST"])
-def sync():
-    if not API_KEY or not hmac.compare_digest(request.headers.get("X-API-Key", ""), API_KEY):
-        return "no autorizado", 401
-    d = request.get_json(silent=True)
-    if not isinstance(d, dict) or not isinstance(d.get("estado"), dict):
-        return "se esperaba {estado, eventos}", 400
+def procesar_reporte(d):
+    """Guarda el estado y los eventos que envía el carro y devuelve las órdenes que debe ejecutar."""
 
     mv = d["estado"].get("mv")
     if isinstance(mv, (int, float)) and 0 <= mv <= 3300:
@@ -173,10 +174,81 @@ def sync():
         except psycopg.Error as e:
             print(f"[ERROR] Base de datos: {e}")   # el carro igual recibe sus órdenes
 
-    # Respuesta en texto simple para que el ESP32 la lea sin librerías: "id comando valor" por línea
     ordenes.sort(key=lambda o: o["id"])
-    cuerpo = "".join(f"{o['id']} {o['comando']} {o['valor']}\n" for o in ordenes)
+    return ordenes
+
+
+def tomar_ordenes():
+    """Saca de la cola las órdenes vigentes (sin estado nuevo del carro)."""
+    ahora = time.time()
+    with CANDADO:
+        limite = ahora - VIGENCIA_COMANDO
+        vencidas = [o for o in COLA if o["creado"] < limite]
+        ordenes = [o for o in COLA if o["creado"] >= limite]
+        COLA.clear()
+    if ordenes or vencidas:
+        try:
+            with pool.connection() as conn:
+                if ordenes:
+                    conn.execute("UPDATE est_comandos SET estado = 'entregado', entregado = now() WHERE id = ANY(%s)",
+                                 ([o["id"] for o in ordenes],))
+                if vencidas:
+                    conn.execute("UPDATE est_comandos SET estado = 'vencido' WHERE id = ANY(%s)",
+                                 ([o["id"] for o in vencidas],))
+        except psycopg.Error as e:
+            print(f"[ERROR] Base de datos: {e}")
+    ordenes.sort(key=lambda o: o["id"])
+    return ordenes
+
+
+def texto_ordenes(ordenes):
+    # Texto simple para que el ESP32 lo lea sin librerías: "id comando valor" por línea
+    return "".join(f"{o['id']} {o['comando']} {o['valor']}\n" for o in ordenes)
+
+
+def clave_valida(clave):
+    return bool(API_KEY) and hmac.compare_digest(clave or "", API_KEY)
+
+
+@app.route("/api/dispositivo/sync", methods=["POST"])
+def sync():
+    if not clave_valida(request.headers.get("X-API-Key", "")):
+        return "no autorizado", 401
+    d = request.get_json(silent=True)
+    if not isinstance(d, dict) or not isinstance(d.get("estado"), dict):
+        return "se esperaba {estado, eventos}", 400
+    cuerpo = texto_ordenes(procesar_reporte(d))
     return cuerpo, 200, {"Content-Type": "text/plain; charset=utf-8"}
+
+
+@sock.route("/ws/carro")
+def ws_carro(ws):
+    """Conexión permanente con el carro: recibe sus reportes y le empuja las órdenes al instante."""
+    if not clave_valida(request.headers.get("X-API-Key", "")):
+        ws.close(reason=1008, message="no autorizado")
+        return
+    print("[WS] Carro conectado")
+    try:
+        while True:
+            msg = ws.receive(timeout=0.05)
+            ordenes = []
+            if msg:
+                try:
+                    d = json.loads(msg)
+                except ValueError:
+                    d = None
+                if isinstance(d, dict) and isinstance(d.get("estado"), dict):
+                    ordenes = procesar_reporte(d)
+            else:
+                with HAY_ORDEN:
+                    if not COLA:
+                        HAY_ORDEN.wait(timeout=0.1)
+                if COLA:
+                    ordenes = tomar_ordenes()
+            if ordenes:
+                ws.send(texto_ordenes(ordenes))
+    except Exception as e:
+        print(f"[WS] Carro desconectado: {e}")
 
 
 # ================= Sesión del panel =================
@@ -260,6 +332,8 @@ def api_comando():
             reemplazadas = [o["id"] for o in COLA if o["comando"] == "espera"]
             COLA[:] = [o for o in COLA if o["comando"] != "espera"]
         COLA.append({"id": fila["id"], "comando": comando, "valor": valor, "creado": time.time()})
+    with HAY_ORDEN:
+        HAY_ORDEN.notify_all()
     if reemplazadas:
         try:
             with pool.connection() as conn:
@@ -703,7 +777,7 @@ td.mono{font:400 13px var(--mono);color:var(--tenue);white-space:nowrap}
     return fetch('/api/comando', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ comando: c, valor: valor }) })
       .then(sesion).then(r => r.json().then(j => {
         if (!r.ok) throw new Error(j.error || 'error');
-        $('nota').textContent = enLinea ? 'Orden enviada. El carro la recibe en menos de un segundo.'
+        $('nota').textContent = enLinea ? 'Orden enviada al carro.'
           : 'Orden guardada, pero el carro no está conectado. Si no se conecta en 30 s, se descarta.';
         if (msg) toast(msg);
       })).catch(e => { if (e.message !== 'sesion') toast('No se pudo enviar la orden'); });
