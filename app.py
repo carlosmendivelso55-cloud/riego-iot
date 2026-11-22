@@ -10,10 +10,11 @@
 # Variables de entorno (se configuran en Render):
 #   DATABASE_URL  cadena de conexión de Supabase ("Session pooler", puerto 5432)
 #   API_KEY       clave que el ESP32 envía en el encabezado X-API-Key
-#   PANEL_CLAVE   contraseña para entrar al panel
-#   SECRET_KEY    texto largo al azar para firmar la sesión del panel
+#   PANEL_CLAVE   (opcional) contraseña del panel; si no existe, se usa la misma de API_KEY
+#   SECRET_KEY    (opcional) firma de la sesión; si no existe, se calcula sola
 #   DEV=1         solo para pruebas en el PC por http (no la pongas en Render)
 
+import hashlib
 import hmac
 import os
 import time
@@ -30,7 +31,8 @@ from psycopg_pool import ConnectionPool
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 API_KEY = os.environ.get("API_KEY", "")
-PANEL_CLAVE = os.environ.get("PANEL_CLAVE", "")
+# Si no hay PANEL_CLAVE en Render, el panel usa la misma clave que API_KEY
+PANEL_CLAVE = os.environ.get("PANEL_CLAVE") or API_KEY
 ZONA = ZoneInfo("America/Bogota")
 
 LIMITE_EN_LINEA = 8      # segundos sin noticias del carro para considerarlo desconectado
@@ -42,7 +44,8 @@ COMANDOS = {"on", "off", "reset", "espera"}
 HISTORIAL_MV = deque(maxlen=1800)
 
 app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY") or os.urandom(32)
+# Si no hay SECRET_KEY en Render, se deriva de las variables que ya existen (no cambia al reiniciar)
+app.secret_key = os.environ.get("SECRET_KEY") or hashlib.sha256(("sesion-panel|" + API_KEY + "|" + DATABASE_URL).encode()).hexdigest()
 app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
