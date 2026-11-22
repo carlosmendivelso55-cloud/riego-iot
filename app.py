@@ -17,9 +17,10 @@
 import hashlib
 import hmac
 import os
+import threading
 import time
 from collections import deque
-from datetime import timedelta
+from datetime import datetime, timedelta
 from functools import wraps
 from zoneinfo import ZoneInfo
 
@@ -42,6 +43,13 @@ COMANDOS = {"on", "off", "reset", "espera"}
 # Historial del voltaje del potenciómetro (posición del carro): 1 punto por reporte, últimos 30 min.
 # Vive en la memoria del servidor (gunicorn con 1 worker); se reinicia si Render reinicia el servicio.
 HISTORIAL_MV = deque(maxlen=1800)
+
+# Estado actual y órdenes pendientes en memoria: el carro y el panel no esperan a la base de datos.
+# La base de datos guarda el registro de eventos, el historial de órdenes y una copia del estado.
+CANDADO = threading.Lock()
+ESTADO_MEM = {"datos": None, "t": 0.0}
+COLA = []                 # órdenes pendientes: dict(id, comando, valor, creado)
+GUARDADO_ESTADO = [0.0]   # última vez que se copió el estado a la base de datos
 
 app = Flask(__name__)
 # Si no hay SECRET_KEY en Render, se deriva de las variables que ya existen (no cambia al reiniciar)
@@ -92,6 +100,10 @@ if DATABASE_URL:
     try:
         with pool.connection() as conn:
             conn.execute(ESQUEMA)
+            conn.execute("UPDATE est_comandos SET estado = 'vencido' WHERE estado = 'pendiente'")
+            fila = conn.execute("SELECT datos, EXTRACT(EPOCH FROM actualizado) AS t FROM est_estado WHERE id = 1").fetchone()
+            if fila:
+                ESTADO_MEM.update(datos=dict(fila["datos"]), t=float(fila["t"]))
         print("[OK] Tablas de la estantería listas")
     except psycopg.Error as e:
         print(f"[ERROR] No se pudieron crear las tablas: {e}")
@@ -128,27 +140,38 @@ def sync():
         if tipo and msg:
             eventos.append((tipo, pos, msg))
 
-    try:
-        with pool.connection() as conn, conn.transaction():
-            conn.execute(
-                "INSERT INTO est_estado (id, datos, actualizado) VALUES (1, %s, now()) "
-                "ON CONFLICT (id) DO UPDATE SET datos = EXCLUDED.datos, actualizado = now()",
-                (Jsonb(d["estado"]),),
-            )
-            for ev in eventos:
-                conn.execute("INSERT INTO est_eventos (tipo, posicion, mensaje) VALUES (%s, %s, %s)", ev)
-            conn.execute(
-                "UPDATE est_comandos SET estado = 'vencido' "
-                "WHERE estado = 'pendiente' AND creado <= now() - make_interval(secs => %s)",
-                (VIGENCIA_COMANDO,),
-            )
-            ordenes = conn.execute(
-                "UPDATE est_comandos SET estado = 'entregado', entregado = now() "
-                "WHERE estado = 'pendiente' RETURNING id, comando, valor"
-            ).fetchall()
-    except psycopg.Error as e:
-        print(f"[ERROR] Base de datos: {e}")
-        return "error de base de datos", 500
+    ahora = time.time()
+    with CANDADO:
+        ESTADO_MEM.update(datos=d["estado"], t=ahora)
+        limite = ahora - VIGENCIA_COMANDO
+        vencidas = [o for o in COLA if o["creado"] < limite]
+        ordenes = [o for o in COLA if o["creado"] >= limite]
+        COLA.clear()
+        guardar_estado = ahora - GUARDADO_ESTADO[0] >= 15 or bool(eventos)
+        if guardar_estado:
+            GUARDADO_ESTADO[0] = ahora
+
+    # Solo se toca la base de datos si hay algo que guardar (eventos, órdenes entregadas o la copia cada 15 s)
+    if eventos or ordenes or vencidas or guardar_estado:
+        try:
+            with pool.connection() as conn, conn.transaction():
+                if guardar_estado:
+                    conn.execute(
+                        "INSERT INTO est_estado (id, datos, actualizado) VALUES (1, %s, now()) "
+                        "ON CONFLICT (id) DO UPDATE SET datos = EXCLUDED.datos, actualizado = now()",
+                        (Jsonb(d["estado"]),),
+                    )
+                if eventos:
+                    with conn.cursor() as cur:
+                        cur.executemany("INSERT INTO est_eventos (tipo, posicion, mensaje) VALUES (%s, %s, %s)", eventos)
+                if ordenes:
+                    conn.execute("UPDATE est_comandos SET estado = 'entregado', entregado = now() WHERE id = ANY(%s)",
+                                 ([o["id"] for o in ordenes],))
+                if vencidas:
+                    conn.execute("UPDATE est_comandos SET estado = 'vencido' WHERE id = ANY(%s)",
+                                 ([o["id"] for o in vencidas],))
+        except psycopg.Error as e:
+            print(f"[ERROR] Base de datos: {e}")   # el carro igual recibe sus órdenes
 
     # Respuesta en texto simple para que el ESP32 la lea sin librerías: "id comando valor" por línea
     ordenes.sort(key=lambda o: o["id"])
@@ -192,22 +215,18 @@ def logout():
 @app.route("/api/estado")
 @requiere_sesion
 def api_estado():
-    try:
-        with pool.connection() as conn:
-            fila = conn.execute(
-                "SELECT datos, actualizado, EXTRACT(EPOCH FROM now() - actualizado) AS edad FROM est_estado WHERE id = 1"
-            ).fetchone()
-            pend = conn.execute("SELECT count(*) AS n FROM est_comandos WHERE estado = 'pendiente'").fetchone()["n"]
-    except psycopg.Error as e:
-        return error_bd(e)
-    if not fila:
+    with CANDADO:
+        datos_mem = ESTADO_MEM["datos"]
+        t = ESTADO_MEM["t"]
+        pend = len(COLA)
+    if not datos_mem:
         return jsonify(sinDatos=True, enLinea=False, pendientes=pend)
-    datos = dict(fila["datos"])
-    edad = float(fila["edad"])
+    datos = dict(datos_mem)
+    edad = max(0.0, time.time() - t)
     datos.update(
         enLinea=edad <= LIMITE_EN_LINEA,
         edad=round(edad),
-        actualizado=fila["actualizado"].astimezone(ZONA).strftime("%d/%m %H:%M:%S"),
+        actualizado=datetime.fromtimestamp(t, ZONA).strftime("%d/%m %H:%M:%S"),
         pendientes=pend,
     )
     return jsonify(datos)
@@ -230,14 +249,23 @@ def api_comando():
             return jsonify(error="la pausa debe estar entre 1 y 600 s"), 400
     try:
         with pool.connection() as conn:
-            if comando == "espera":
-                # solo vale la última pausa pedida
-                conn.execute("UPDATE est_comandos SET estado = 'vencido' WHERE estado = 'pendiente' AND comando = 'espera'")
             fila = conn.execute(
                 "INSERT INTO est_comandos (comando, valor) VALUES (%s, %s) RETURNING id", (comando, valor)
             ).fetchone()
     except psycopg.Error as e:
         return error_bd(e)
+    reemplazadas = []
+    with CANDADO:
+        if comando == "espera":   # solo vale la última pausa pedida
+            reemplazadas = [o["id"] for o in COLA if o["comando"] == "espera"]
+            COLA[:] = [o for o in COLA if o["comando"] != "espera"]
+        COLA.append({"id": fila["id"], "comando": comando, "valor": valor, "creado": time.time()})
+    if reemplazadas:
+        try:
+            with pool.connection() as conn:
+                conn.execute("UPDATE est_comandos SET estado = 'vencido' WHERE id = ANY(%s)", (reemplazadas,))
+        except psycopg.Error as e:
+            print(f"[ERROR] Base de datos: {e}")
     return jsonify(ok=True, id=fila["id"]), 201
 
 
@@ -675,7 +703,7 @@ td.mono{font:400 13px var(--mono);color:var(--tenue);white-space:nowrap}
     return fetch('/api/comando', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ comando: c, valor: valor }) })
       .then(sesion).then(r => r.json().then(j => {
         if (!r.ok) throw new Error(j.error || 'error');
-        $('nota').textContent = enLinea ? 'Orden enviada. El carro la recibe en 1 a 2 segundos.'
+        $('nota').textContent = enLinea ? 'Orden enviada. El carro la recibe en menos de un segundo.'
           : 'Orden guardada, pero el carro no está conectado. Si no se conecta en 30 s, se descarta.';
         if (msg) toast(msg);
       })).catch(e => { if (e.message !== 'sesion') toast('No se pudo enviar la orden'); });
@@ -874,7 +902,7 @@ td.mono{font:400 13px var(--mono);color:var(--tenue);white-space:nowrap}
   }
 
   actualizar(); cargarRegistro(); cargarVoltaje();
-  setInterval(actualizar, 1000);
+  setInterval(actualizar, 600);
   setInterval(cargarVoltaje, 2000);
   setInterval(cargarRegistro, 3000);
 })();
