@@ -197,9 +197,6 @@ def iniciar_mqtt():
     if not (MQTT_HOST and MQTT_USER):
         print("[AVISO] MQTT no configurado (MQTT_HOST, MQTT_USER, MQTT_PASS)")
         return
-    # Diagnóstico sin revelar la clave: muestra el usuario exacto y cuántos caracteres tiene la clave
-    print(f"[MQTT] Host={MQTT_HOST!r} puerto={MQTT_PORT} usuario={MQTT_USER!r} "
-          f"clave={len(MQTT_PASS)} caracteres, espacios al borde={MQTT_PASS != MQTT_PASS.strip()}")
     c = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2,
                     client_id=f"servidor-banda-{os.getpid()}", clean_session=True)
     c.username_pw_set(MQTT_USER, MQTT_PASS)
