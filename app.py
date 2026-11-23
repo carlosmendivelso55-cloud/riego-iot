@@ -10,6 +10,9 @@
 #   PANEL_USER, PANEL_CLAVE   credenciales para entrar al panel
 #   JWT_SECRET                (opcional) clave para firmar los JWT; si no existe se deriva de las demás
 
+# Carga el códec idna antes de que arranquen los hilos (evita 'unknown encoding: idna' en Python 3.13+)
+import encodings.idna  # noqa: F401
+"servidor".encode("idna")
 import hashlib
 import hmac
 import json
