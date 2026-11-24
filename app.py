@@ -73,13 +73,18 @@ STATS = {"mensajes": 0, "malformados": 0, "ultimo_msg": 0.0, "mqtt_conectado": F
 influx = None
 write_api = None
 query_api = None
-if INFLUX_URL and INFLUX_TOKEN and INFLUX_ORG:
+
+
+def iniciar_influx():
+    global influx, write_api, query_api
+    if not (INFLUX_URL and INFLUX_TOKEN and INFLUX_ORG):
+        print("[AVISO] InfluxDB no configurado (INFLUX_URL, INFLUX_TOKEN, INFLUX_ORG)")
+        return
     influx = InfluxDBClient(url=INFLUX_URL, token=INFLUX_TOKEN, org=INFLUX_ORG, timeout=10_000)
     # Escritura por lotes: junta puntos y los envía cada 2 s (menos peticiones a la nube)
     write_api = influx.write_api(write_options=WriteOptions(batch_size=100, flush_interval=2_000))
     query_api = influx.query_api()
-else:
-    print("[AVISO] InfluxDB no configurado (INFLUX_URL, INFLUX_TOKEN, INFLUX_ORG)")
+    print("[INFLUX] Cliente listo")
 
 
 def guardar_medicion(nodo, variable, valor, unidad, ts_ms):
@@ -201,7 +206,7 @@ def iniciar_mqtt():
     print(f"[MQTT] Host={MQTT_HOST!r} puerto={MQTT_PORT} usuario={MQTT_USER!r} "
           f"clave={len(MQTT_PASS)} caracteres, espacios al borde={MQTT_PASS != MQTT_PASS.strip()}")
     c = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2,
-                    client_id=f"servidor-banda-{os.getpid()}", clean_session=True)
+                    client_id=f"servidor-banda-{os.getpid()}-{os.urandom(3).hex()}", clean_session=True)
     c.username_pw_set(MQTT_USER, MQTT_PASS)
     if MQTT_TLS:
         c.tls_set(cert_reqs=ssl.CERT_REQUIRED)   # valida el certificado del broker con las CA del sistema
@@ -214,7 +219,28 @@ def iniciar_mqtt():
     mqtt_cliente = c
 
 
-iniciar_mqtt()
+# Los hilos (MQTT e InfluxDB) se arrancan dentro del proceso que atiende las peticiones.
+# Gunicorn puede importar este archivo en el proceso maestro y luego copiarlo (fork) al worker:
+# los hilos no pasan con la copia, así que se inician aquí, una vez por proceso.
+_SERVICIOS = {"pid": None}
+_CANDADO_INICIO = threading.Lock()
+
+
+def asegurar_servicios():
+    if _SERVICIOS["pid"] == os.getpid():
+        return
+    with _CANDADO_INICIO:
+        if _SERVICIOS["pid"] == os.getpid():
+            return
+        STATS["mqtt_conectado"] = False
+        iniciar_influx()
+        iniciar_mqtt()
+        _SERVICIOS["pid"] = os.getpid()
+
+
+@app.before_request
+def _antes_de_cada_peticion():
+    asegurar_servicios()
 
 
 # ---------------- Autenticación JWT ----------------
@@ -353,7 +379,7 @@ def status():
     """Público y sin datos sensibles: sirve para revisar el sistema y para mantener despierto el servicio."""
     return jsonify(
         mqtt=STATS["mqtt_conectado"],
-        influx=bool(write_api),
+        influx=bool(INFLUX_URL and INFLUX_TOKEN and INFLUX_ORG),
         mensajes=STATS["mensajes"],
         malformados=STATS["malformados"],
         influx_errores=STATS["influx_errores"],
@@ -373,4 +399,5 @@ def pagina_login():
 
 
 if __name__ == "__main__":
+    asegurar_servicios()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=False)
